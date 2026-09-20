@@ -1,0 +1,56 @@
+sequenceDiagram
+    autonumber
+    participant AON as "POR / AON PWR_MGR"
+    participant ROM as "BootROM"
+    participant IO as "UART / USB / SD"
+    participant BURN as "SRAM Burner"
+    participant FLASH as "A/B Flash"
+    participant BL as "Bootloader"
+    participant FW as "Firmware / RTOS"
+
+    AON->>AON: 拉起 AON/CPU 最小 Voltage Domain，启动安全 Clock
+    AON->>AON: 保持 Isolation 与 Reset；等待 PGOOD 和 Clock Stable
+    AON->>ROM: 同步释放主 Hart Reset，PC 指向片内 Reset Vector
+    Note over AON,ROM: BootROM 固化并原地取指，不存在“加载 BootROM”
+
+    ROM->>ROM: 捕获 reset/wake reason，建立栈和 AON Timer 超时源
+    ROM->>ROM: 仅使能 SRAM 与启动介质 Clock，并释放必要 Reset
+    Note over ROM: 使用安全 OPP；硬件 Thermal Trip 保持有效；不依赖 mcycle 做超时
+
+    alt 恢复或量产路径
+        IO->>ROM: SYNC + Burner Header + Burner Payload
+        ROM->>ROM: 校验 Chip ID、SRAM 范围、Hash、签名、防回滚
+        ROM->>BURN: 写 SRAM；清中断/Cache；fence.i；跳转
+
+        BURN->>BURN: PWR_MGR 固定 RUN，关闭 Sleep/DFS/DVFS
+        BURN->>BURN: 配置传输/Flash Clock，确认 Voltage 与 Thermal 安全
+        BURN->>BURN: Clock 稳定后同步释放 Flash Controller Reset
+        IO->>BURN: Manifest + 签名 + Bootloader/FW Payload 帧
+        BURN->>FLASH: 写非活动区；每块计算 CRC/SHA 并回读
+        BURN->>FLASH: 最后写 FIMG Header、Valid/Pending/Boot Control
+        Note over BURN,FLASH: Brownout/过温时不启动下一次擦写，也不提交 Valid；Flash Busy 时不得直接断电
+        BURN->>AON: 请求 Cold Reset
+    else 正常启动路径
+        ROM->>FLASH: 读取并认证 Bootloader FIMG
+        ROM->>BL: COPY 或 XIP；Cache 维护和 fence.i 后跳转
+
+        BL->>BL: 先保持安全 OPP，读取 eFuse Thermal Trim
+        BL->>BL: Power On → PGOOD → Stable Clock → De-isolate → Deassert Reset
+        BL->>BL: 升频先升 Voltage；配置 PLL 并等待 Lock
+        BL->>BL: 初始化 NoC、DDR Voltage/Clock/Reset、Training 与 ECC
+        BL->>BL: 设置 Thermal Trip，清零 Perf Counters，建立 boot_info
+        BL->>FLASH: 读取 Boot Control；选择并认证 A/B FW Slot
+        BL->>FW: 解压/复制到 SRAM/DDR 或 XIP；传递 boot_info 后跳转
+
+        FW->>FW: 接管 Clock/Reset/Regulator/Power Domain 驱动
+        FW->>FW: Thermal Governor + Perf Counter 反馈驱动 DVFS/QoS
+        FW->>FW: 升频：Voltage Up → Stable → Clock Up
+        FW->>FW: 降频：Clock Down → Voltage Down
+        alt Pending Slot 健康检查成功
+            FW->>FLASH: 原子提交 Confirmed，再提升可信 rollback floor
+        else 健康检查失败或超时
+            FW->>AON: Watchdog Reset；下次按 retry_left 回退
+        end
+    end
+
+    Note over AON,FW: PWR_MGR/Power PMU = 电源管理；PMU_COUNTERS/CPU PMU = 性能监控，两者不可混写

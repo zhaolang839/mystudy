@@ -1,0 +1,47 @@
+sequenceDiagram
+    autonumber
+    participant PC as "PC fwtransport"
+    participant ROM as "BootROM Receiver"
+    participant SRAM as "SRAM"
+    participant BURN as "Burner Receiver"
+    participant STAGE as "Immutable Staging"
+    participant FLASH as "Target Flash"
+
+    Note over PC,ROM: Session 1：ROM 只接收 Burner；每帧 Header CRC + Payload CRC
+    PC->>ROM: HELLO(role=BOOTROM, session=R, seq=0)
+    ROM-->>PC: ACK(seq=0)
+    PC->>ROM: ROM_BEGIN_IMAGE(Descriptor + Signature)
+    ROM-->>PC: ACK
+    loop offset 从 0 连续递增
+        PC->>ROM: ROM_IMAGE_DATA(offset, <=1024 B)
+        ROM->>SRAM: 写 load_addr + offset，并累计 CRC/SHA
+        ROM-->>PC: ACK；ACK 丢失时允许相同帧幂等重传
+    end
+    PC->>ROM: ROM_END_IMAGE
+    ROM->>ROM: 验证长度、CRC、SHA、Ed25519、Chip ID、rollback
+    ROM-->>PC: ACK
+    PC->>ROM: ROM_EXECUTE
+    ROM-->>PC: ACK
+    ROM->>BURN: ACK 发出后清 Cache、fence.i、跳转 Burner
+
+    Note over PC,BURN: Session 2：Burner 接收完整 Bundle；使用新的 session=B
+    PC->>BURN: HELLO(role=BURNER, session=B, seq=0)
+    BURN-->>PC: ACK
+    PC->>BURN: BUNDLE_BEGIN(total_size + Package Header)
+    BURN->>STAGE: 创建固定大小的 staging 快照
+    BURN-->>PC: ACK
+    loop package_offset 从 128 连续递增
+        PC->>BURN: BUNDLE_DATA(package_offset, <=1024 B)
+        BURN->>STAGE: 写入对应 package_offset
+        BURN-->>PC: ACK
+    end
+    PC->>BURN: BUNDLE_END
+    BURN->>STAGE: Finalize；禁止 Host/DMA 再修改
+    BURN-->>PC: ACK
+    PC->>BURN: BUNDLE_INSTALL
+    BURN->>BURN: 验证包级 Manifest、全部对象、签名、目标区和擦除计划
+    BURN->>FLASH: 写 Payload、回读，再写 FIMG/Commit-last
+    BURN-->>PC: ACK(PROGRAM_SUCCESS)
+    BURN->>ROM: 请求 Cold Reset，重新进入正常启动链
+
+    Note over PC,BURN: session 不匹配、乱序或 CRC 错误返回 NACK(expected_seq,status)；安全认证失败后不得擦除活动区

@@ -1,0 +1,62 @@
+flowchart TB
+    subgraph HOST["主机：生成并验证二进制产物"]
+        direction LR
+        IMG["输入镜像<br/>burner.bin<br/>bootloader.bin<br/>fw_a.bin / fw_b.bin"]
+        META["输入元数据<br/>分区、地址、版本<br/>Hash、签名、Chip ID"]
+        PACK["fwpack.py<br/>边界、容量、重叠、对齐检查"]
+        BUNDLE[("factory-bundle.bin<br/>传输容器，不等于 Flash 地址空间")]
+        LAYOUT["fwlayout.py<br/>按目标 Flash offset 重排"]
+        RAW[("flash-layout.bin<br/>仅供空片/外部编程器")]
+
+        IMG --> PACK
+        META --> PACK
+        PACK --> BUNDLE
+        BUNDLE --> LAYOUT --> RAW
+    end
+
+    subgraph DELIVERY["传送方式"]
+        direction LR
+        HOSTTOOL["PC 烧录工具<br/>解析 Bundle"]
+        UART["UART / USB<br/>带 Seq、Offset、CRC 的帧"]
+        SD[("SD / eMMC<br/>保存完整 Bundle")]
+        PROGRAMMER["外部 Flash 编程器"]
+    end
+
+    subgraph CHIP["SoC：恢复烧录与正常启动"]
+        direction LR
+        ROM["BootROM<br/>片内 ROM 原地执行<br/>不加载 BootROM 镜像"]
+        SRAM[("SRAM<br/>临时 Burner 字节")]
+        BURN["SRAM Burner<br/>包验证与安装状态机"]
+        NVM[("持久 Flash<br/>Bootloader FIMG<br/>FW Slot A / B FIMG<br/>Partition / Boot Control / Config")]
+        BL["Bootloader 运行态<br/>SRAM 或 XIP"]
+        FW["Firmware 运行态<br/>SRAM / DDR 或 XIP"]
+        RESET(["Cold Reset"])
+    end
+
+    BUNDLE --> HOSTTOOL
+    HOSTTOOL -->|"阶段 1：仅提取 Burner Header、签名和 Payload"| UART
+    HOSTTOOL -->|"阶段 2：Manifest、镜像签名和各 Payload"| UART
+    BUNDLE -->|"完整文件复制"| SD
+    RAW --> PROGRAMMER
+
+    UART -->|"ROM 下载协议"| ROM
+    ROM -->|"边界与认证通过后写 load_addr"| SRAM
+    SRAM -->|"清 Cache、fence.i、跳转 entry"| BURN
+    UART -->|"Burner 传输协议"| BURN
+
+    SD -->|"仅当 ROM 原生支持该恢复格式时取 Burner"| ROM
+    SD -->|"Burner 读取 Manifest 与其余对象"| BURN
+
+    BURN -->|"描述符决定目标地址；先 Payload 后 FIMG/Commit"| NVM
+    PROGRAMMER -->|"按真实 Flash offset 写入并回读"| NVM
+    BURN -.->|"PROGRAM_SUCCESS"| RESET
+    PROGRAMMER -.->|"编程完成后上电/复位"| RESET
+    RESET -.-> ROM
+
+    NVM -->|"Bootloader FIMG Header + stored payload"| ROM
+    ROM -->|"认证后复制至 SRAM，或配置 XIP"| BL
+    BL -.->|"读取 Boot Control，选择 A/B"| NVM
+    NVM -->|"选定 FW FIMG + stored payload"| BL
+    BL -->|"解压/复制得到 plain bytes，或配置 XIP"| FW
+
+    LEGEND["实线：字节流<br/>虚线：选择、跳转或 Reset 控制流"] -.-> ROM
